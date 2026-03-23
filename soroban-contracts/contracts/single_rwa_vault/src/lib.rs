@@ -889,3 +889,9 @@ fn require_active_or_funding(e: &Env) {
         panic_with_error!(e, Error::InvalidVaultState);
     }
 }
+
+fn require_not_blacklisted(e: &Env, addr: &Address) {
+    if get_blacklisted(e, addr) {
+        panic_with_error!(e, Error::AddressBlacklisted);
+    }
+}
