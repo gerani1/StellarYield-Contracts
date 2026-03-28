@@ -66,4 +66,24 @@ pub enum Error {
     TimelockActionCancelled = 37,
     /// Only admin can perform timelock operations.
     TimelockAdminOnly = 38,
+    /// Caller is not in the emergency signers list.
+    NotEmergencySigner = 39,
+    /// The referenced emergency proposal does not exist.
+    ProposalNotFound = 40,
+    /// The emergency proposal has passed its expiry timeout.
+    ProposalExpired = 41,
+    /// The emergency proposal has already been executed.
+    ProposalAlreadyExecuted = 42,
+    /// Approval threshold has not been reached yet.
+    ThresholdNotMet = 43,
+    /// This signer has already approved this proposal.
+    AlreadyApproved = 44,
+    /// Threshold must be >= 1 and <= number of signers.
+    InvalidThreshold = 45,
+    /// Vault total assets exceeds the funding target during the funding phase.
+    FundingTargetExceeded = 46,
+    /// Amount corresponds to zero shares during preview.
+    PreviewZeroShares = 47,
+    /// Shares correspond to zero assets during preview.
+    PreviewZeroAssets = 48,
 }

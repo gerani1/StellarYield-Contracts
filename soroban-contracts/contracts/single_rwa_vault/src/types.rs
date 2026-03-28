@@ -189,3 +189,13 @@ pub struct TimelockAction {
     pub executed: bool,
     pub cancelled: bool,
 }
+
+/// A pending multi-sig emergency withdrawal proposal.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EmergencyProposal {
+    pub recipient: Address,
+    pub proposed_at: u64,
+    pub executed: bool,
+}
+}
