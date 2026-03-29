@@ -103,6 +103,82 @@ fn test_get_vault_info_includes_underlying_asset() {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── Empty registry (#170) ───────────────────────────────────────────────────
+
+/// get_all_vaults returns an empty vec when no vaults have been created yet.
+#[test]
+fn test_get_all_vaults_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _) = setup_factory(&e);
+
+    let all = client.get_all_vaults();
+    assert_eq!(
+        all.len(),
+        0,
+        "get_all_vaults must return an empty vec when the registry is empty"
+    );
+}
+
+/// get_active_vaults returns an empty vec when no vaults have been created yet.
+#[test]
+fn test_get_active_vaults_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _) = setup_factory(&e);
+
+    let active = client.get_active_vaults();
+    assert_eq!(
+        active.len(),
+        0,
+        "get_active_vaults must return an empty vec when the registry is empty"
+    );
+}
+
+/// get_vault_count returns 0 when no vaults have been created yet.
+#[test]
+fn test_get_vault_count_is_zero_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _) = setup_factory(&e);
+
+    assert_eq!(
+        client.get_vault_count(),
+        0u32,
+        "vault count must be 0 when no vaults exist"
+    );
+}
+
+/// get_vaults_paginated returns an empty vec when the registry is empty.
+#[test]
+fn test_get_vaults_paginated_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _) = setup_factory(&e);
+
+    let page = client.get_vaults_paginated(&0, &10);
+    assert_eq!(
+        page.len(),
+        0,
+        "get_vaults_paginated must return an empty vec when the registry is empty"
+    );
+}
+
+/// get_active_vaults_paginated returns an empty vec when the registry is empty.
+#[test]
+fn test_get_active_vaults_paginated_returns_empty_when_no_vaults() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _) = setup_factory(&e);
+
+    let page = client.get_active_vaults_paginated(&0, &10);
+    assert_eq!(
+        page.len(),
+        0,
+        "get_active_vaults_paginated must return an empty vec when the registry is empty"
+    );
+}
+
 // ─── ActiveVaults list ────────────────────────────────────────────────────────
 
 /// set_vault_status keeps ActiveVaults in sync: deactivating removes,
@@ -536,4 +612,136 @@ fn test_batch_create_vaults_at_limit_ok() {
             "batch of 10 should not trigger BatchTooLarge"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #214 — Forward-looking: mixed vault types (SingleRwa + Aggregator)
+//
+// The Aggregator vault type is already declared in VaultType but not yet
+// deployable through the factory.  This test documents the *desired* registry
+// behaviour once Aggregator vaults are supported:
+//
+//   • get_all_vaults()    → returns every vault regardless of type
+//   • get_active_vaults() → returns every active vault regardless of type
+//   • get_single_rwa_vaults() — SingleRwa list must NOT include Aggregator entries
+//
+// The test is marked #[ignore] so it does not block CI until the Aggregator
+// vault type is fully implemented.  Remove the #[ignore] attribute and fill in
+// the deployment call once create_aggregator_vault (or equivalent) is added to
+// the factory.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Forward-looking test: registry correctly separates SingleRwa and Aggregator
+/// vault types when both exist side-by-side.
+///
+/// Marked #[ignore] — Aggregator deployment is not yet implemented in the
+/// factory.  This test serves as a specification stub that compiles cleanly and
+/// will be activated once the feature lands.
+#[test]
+#[ignore]
+fn test_mixed_vault_types_registry_filtering() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (client, _admin) = setup_factory(&e);
+    let factory_id = client.address.clone();
+
+    // Inject a SingleRwa vault directly (active).
+    let single_rwa_vault = inject_vault(&e, &factory_id, true);
+
+    // Inject a stub Aggregator vault entry directly into the registry.
+    // TODO: replace this manual injection with a real factory call once
+    //       `create_aggregator_vault` is implemented.
+    let aggregator_vault = Address::generate(&e);
+    let aggregator_info = crate::types::VaultInfo {
+        vault: aggregator_vault.clone(),
+        asset: Address::generate(&e),
+        vault_type: crate::types::VaultType::Aggregator,
+        name: String::from_str(&e, "Aggregator Vault"),
+        symbol: String::from_str(&e, "AGG"),
+        active: true,
+        created_at: e.ledger().timestamp(),
+    };
+    e.as_contract(&factory_id, || {
+        put_vault_info(&e, &aggregator_vault, aggregator_info);
+        push_all_vaults(&e, aggregator_vault.clone());
+        push_active_vaults(&e, aggregator_vault.clone());
+        // Intentionally NOT pushed to SingleRwaVaults list.
+    });
+
+    // ── get_all_vaults returns both types ─────────────────────────────────────
+    let all = client.get_all_vaults();
+    assert_eq!(all.len(), 2, "get_all_vaults must return both vault types");
+    assert!(
+        all.contains(single_rwa_vault.clone()),
+        "all vaults must include SingleRwa vault"
+    );
+    assert!(
+        all.contains(aggregator_vault.clone()),
+        "all vaults must include Aggregator vault"
+    );
+
+    // ── get_active_vaults returns both active entries ─────────────────────────
+    let active = client.get_active_vaults();
+    assert_eq!(
+        active.len(),
+        2,
+        "get_active_vaults must return all active vaults"
+    );
+
+    // ── SingleRwa-specific list must not include the Aggregator vault ─────────
+    e.as_contract(&factory_id, || {
+        let single_rwa_list = get_single_rwa_vaults(&e);
+        assert!(
+            single_rwa_list.contains(single_rwa_vault.clone()),
+            "SingleRwaVaults list must contain the SingleRwa vault"
+        );
+        assert!(
+            !single_rwa_list.contains(aggregator_vault.clone()),
+            "SingleRwaVaults list must NOT contain the Aggregator vault"
+        );
+    });
+
+    // ── VaultInfo.vault_type discriminates correctly ───────────────────────────
+    let single_info = client
+        .get_vault_info(&single_rwa_vault)
+        .expect("SingleRwa VaultInfo must exist");
+    assert_eq!(single_info.vault_type, crate::types::VaultType::SingleRwa);
+
+    let agg_info = client
+        .get_vault_info(&aggregator_vault)
+        .expect("Aggregator VaultInfo must exist");
+    assert_eq!(agg_info.vault_type, crate::types::VaultType::Aggregator);
+}
+
+// ─── Vault Ordering ───────────────────────────────────────────────────────────
+
+/// get_all_vaults returns vaults in the order they were created.
+#[test]
+fn test_get_all_vaults_returns_vaults_in_creation_order() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin) = setup_factory(&e);
+    let factory_id = client.address.clone();
+
+    // Inject vaults in a known order
+    let v1 = inject_vault(&e, &factory_id, true);
+    let v2 = inject_vault(&e, &factory_id, true);
+    let v3 = inject_vault(&e, &factory_id, true);
+    let v4 = inject_vault(&e, &factory_id, true);
+
+    // Get all vaults
+    let all_vaults = client.get_all_vaults();
+
+    // Verify count
+    assert_eq!(all_vaults.len(), 4);
+
+    // Verify order matches creation order
+    assert_eq!(all_vaults.get(0).unwrap(), v1);
+    assert_eq!(all_vaults.get(1).unwrap(), v2);
+    assert_eq!(all_vaults.get(2).unwrap(), v3);
+    assert_eq!(all_vaults.get(3).unwrap(), v4);
+
+    // Verify vault count matches
+    assert_eq!(client.get_vault_count(), 4);
 }

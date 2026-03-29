@@ -6,6 +6,7 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
+use crate::test_helpers::{mint_usdc, setup, setup_with_kyc_bypass};
 use crate::{math, InitParams, Role, SingleRWAVault, SingleRWAVaultClient};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ fn make_vault(env: &Env) -> (Address, Address, Address, Address) {
             rwa_category: String::from_str(env, "Bond"),
             expected_apy: 500u32,
             timelock_delay: 172800u64, // 48 hours
+            yield_vesting_period: 0u64,
         },),
     );
 
@@ -621,6 +623,178 @@ fn test_redeem_at_maturity_zero_shares_panics() {
     vault.redeem_at_maturity(&user, &0i128, &user, &user);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — #198: Over-redemption is rejected
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attempting to redeem more shares than the user owns must fail with
+/// Error::InsufficientBalance (#20).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_redeem_more_shares_than_owned_panics() {
+    // Use setup_with_kyc_bypass — the same working infrastructure used by
+    // test_withdraw.rs (which verifies redeem happy-paths against this context).
+    let ctx = setup_with_kyc_bypass();
+    let v = ctx.vault();
+
+    let deposit_amount = 5_000_000i128; // 5 USDC
+
+    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, deposit_amount);
+    v.deposit(&ctx.user, &deposit_amount, &ctx.user);
+
+    // Lower the funding target so the vault can be activated.
+    let current = v.total_assets();
+    if current < ctx.params.funding_target {
+        v.set_funding_target(&ctx.admin, &current);
+    }
+    v.activate_vault(&ctx.admin);
+
+    let shares = v.balance(&ctx.user);
+    assert!(shares > 0, "user must hold shares");
+
+    // Attempt to redeem one more share than the user holds — must panic.
+    v.redeem(&ctx.user, &(shares + 1), &ctx.user, &ctx.user);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — #220: Claiming yield after early full redemption
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// If yield was distributed BEFORE a user fully redeems early, the snapshot
+/// taken at `request_early_redemption` time preserves their share balance for
+/// that epoch.  The user must still be able to claim that pending yield after
+/// their shares enter escrow (i.e., after the redemption is initiated).
+///
+/// Design note: `request_early_redemption` moves shares to escrow (balance → 0)
+/// but does NOT burn them or remove them from the yield snapshot.  This test
+/// verifies that the pre-request snapshot allows the user to claim yield earned
+/// before they initiated redemption, even though their live balance is now 0.
+#[test]
+fn test_claim_yield_earned_before_early_full_redemption_succeeds() {
+    let ctx = setup();
+    let v = ctx.vault();
+
+    let deposit_amount = 10_000_000i128; // 10 USDC
+
+    // KYC-approve and deposit for user (the one who will redeem early).
+    crate::test_helpers::MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&ctx.user);
+    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, deposit_amount);
+    v.deposit(&ctx.user, &deposit_amount, &ctx.user);
+
+    // Second depositor keeps the vault funded so yield math remains non-trivial.
+    let other = Address::generate(&ctx.env);
+    crate::test_helpers::MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&other);
+    mint_usdc(&ctx.env, &ctx.asset_id, &other, deposit_amount);
+    v.deposit(&other, &deposit_amount, &other);
+
+    // Activate vault.
+    v.set_funding_target(&ctx.admin, &0i128);
+    v.activate_vault(&ctx.operator);
+
+    let shares = v.balance(&ctx.user);
+    assert!(shares > 0, "user must hold shares before redemption");
+
+    // Distribute yield WHILE user still holds all their shares (creates epoch 1).
+    // At this point user has 50% of total shares → entitled to 50% of yield.
+    let yield_amount = 100_000i128;
+    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.operator, yield_amount);
+    v.distribute_yield(&ctx.operator, &yield_amount);
+
+    // Sanity check: user has pending yield before initiating redemption.
+    let pending_before = v.pending_yield(&ctx.user);
+    assert!(
+        pending_before > 0,
+        "user must have pending yield before redemption"
+    );
+
+    // User requests early redemption of ALL shares.
+    // `request_early_redemption` calls `update_user_snapshot`, which snapshots
+    // the user's balance at epoch 1 BEFORE moving shares to escrow.
+    // After this call: user's live balance = 0, escrowed_shares = shares.
+    let _ = v.request_early_redemption(&ctx.user, &shares);
+
+    // Live balance is now zero (shares are moved to escrow).
+    assert_eq!(
+        v.balance(&ctx.user),
+        0,
+        "live balance must be zero after request"
+    );
+
+    // Pending yield for epoch 1 must remain accessible: the snapshot taken at
+    // request time recorded the user's pre-escrow balance for that epoch.
+    let pending_after = v.pending_yield(&ctx.user);
+    assert_eq!(
+        pending_after, pending_before,
+        "pending yield for epoch 1 must survive early redemption request"
+    );
+
+    // claim_yield succeeds — the vault still holds the tokens (process_early_redemption
+    // has not yet transferred them out).
+    let claimed = v.claim_yield(&ctx.user);
+    assert_eq!(
+        claimed, pending_before,
+        "claimed amount must equal pre-redemption pending yield"
+    );
+
+    // All yield is now claimed.
+    assert_eq!(
+        v.pending_yield(&ctx.user),
+        0,
+        "pending yield must be zero after claim"
+    );
+}
+
+/// If yield is distributed AFTER a user has moved all their shares into escrow
+/// via `request_early_redemption`, the user's live balance is 0 at distribution
+/// time.  Because no pre-distribution snapshot exists for that epoch, they
+/// receive no yield.  A subsequent `claim_yield` call must fail with
+/// Error::NoYieldToClaim (#9).
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_claim_yield_distributed_after_early_full_redemption_panics() {
+    let ctx = setup();
+    let v = ctx.vault();
+
+    let deposit_amount = 10_000_000i128;
+
+    // KYC-approve and deposit for user.
+    crate::test_helpers::MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&ctx.user);
+    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, deposit_amount);
+    v.deposit(&ctx.user, &deposit_amount, &ctx.user);
+
+    // Second depositor keeps total_supply positive after user's shares are escrowed.
+    let other = Address::generate(&ctx.env);
+    crate::test_helpers::MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&other);
+    mint_usdc(&ctx.env, &ctx.asset_id, &other, deposit_amount);
+    v.deposit(&other, &deposit_amount, &other);
+
+    v.set_funding_target(&ctx.admin, &0i128);
+    v.activate_vault(&ctx.operator);
+
+    let shares = v.balance(&ctx.user);
+
+    // User requests early redemption of ALL shares BEFORE any yield is distributed.
+    // After this: user's live balance = 0 (shares are in escrow).
+    let _ = v.request_early_redemption(&ctx.user, &shares);
+    assert_eq!(v.balance(&ctx.user), 0, "user live balance must be zero");
+
+    // Yield distributed AFTER the user's balance is zero — no snapshot exists
+    // at epoch 1 for this user, so the fallback to live balance (0) gives 0 yield.
+    let yield_amount = 100_000i128;
+    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.operator, yield_amount);
+    v.distribute_yield(&ctx.operator, &yield_amount);
+
+    // Verify: user has no pending yield for epoch 1.
+    assert_eq!(
+        v.pending_yield(&ctx.user),
+        0,
+        "user must have no pending yield"
+    );
+
+    // Must panic with NoYieldToClaim (#9).
+    v.claim_yield(&ctx.user);
+}
+
 /// Blacklisted address cannot redeem shares.
 #[test]
 #[should_panic(expected = "Error(Contract, #14)")] // Error::AddressBlacklisted = 14
@@ -648,4 +822,60 @@ fn test_redeem_blacklisted_address_panics() {
 
     // Try to redeem — should panic with AddressBlacklisted
     vault.redeem(&user, &shares, &user, &user);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-epoch yield distribution (#161)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Three consecutive `distribute_yield` calls advance epochs and cumulative
+/// accounting; per-epoch amounts and `total_yield_distributed` stay consistent (#161).
+#[test]
+fn test_multiple_consecutive_yield_distributions_interleaved_claims() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user = Address::generate(&env);
+    let deposit_amount = 2_000_000i128;
+
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user, deposit_amount);
+    activate(&env, &vault_id, &admin);
+
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
+
+    let y1 = 60_000_i128;
+    let y2 = 120_000_i128;
+    let y3 = 180_000_i128;
+    let total_distributed = y1 + y2 + y3;
+
+    assert_eq!(vault.current_epoch(), 0u32);
+
+    assert_eq!(
+        distribute_yield(&env, &vault_id, &token_id, &admin, y1),
+        1u32
+    );
+    assert_eq!(vault.epoch_yield(&1u32), y1);
+    assert_eq!(vault.current_epoch(), 1u32);
+
+    assert_eq!(
+        distribute_yield(&env, &vault_id, &token_id, &admin, y2),
+        2u32
+    );
+    assert_eq!(vault.epoch_yield(&2u32), y2);
+    assert_eq!(vault.current_epoch(), 2u32);
+
+    assert_eq!(
+        distribute_yield(&env, &vault_id, &token_id, &admin, y3),
+        3u32
+    );
+    assert_eq!(vault.epoch_yield(&3u32), y3);
+    assert_eq!(vault.current_epoch(), 3u32);
+
+    assert_eq!(vault.total_yield_distributed(), total_distributed);
+    assert_eq!(
+        vault.total_assets(),
+        deposit_amount + total_distributed,
+        "underlying accounting accumulates deposits plus all epoch yield"
+    );
 }
